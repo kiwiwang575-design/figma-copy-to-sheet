@@ -1,0 +1,135 @@
+  function doPost(e) {
+    try {
+      var props = PropertiesService.getScriptProperties();
+      var expectedToken = props.getProperty('TOKEN');
+      var sheetId = props.getProperty('SHEET_ID');
+      var defaultSheetName = props.getProperty('DEFAULT_SHEET_NAME') || 'sheet name';
+
+      if (!expectedToken || !sheetId) {
+        console.error('Missing TOKEN or SHEET_ID');
+        return json_({ ok: false, error: 'Server misconfigured' });
+      }
+
+      var bodyText = (e && e.postData && e.postData.contents) ? e.postData.contents : '';
+      var body;
+      try {
+        body = JSON.parse(bodyText || '{}');
+      } catch (err) {
+        console.error('Invalid JSON body', String(err));
+        return json_({ ok: false, error: 'Invalid request' });
+      }
+
+      if (!body.token || body.token !== expectedToken) {
+        return json_({ ok: false, error: 'Unauthorized' });
+      }
+
+      var sheetName = (body.sheetName || defaultSheetName).toString().trim();
+      var ss = SpreadsheetApp.openById(sheetId);
+      var sheet = ss.getSheetByName(sheetName);
+      if (!sheet) {
+        console.error('Sheet tab not found', sheetName);
+        return json_({ ok: false, error: 'Sheet tab not found' });
+      }
+
+      var items = Array.isArray(body.items) ? body.items : [];
+      var rows = [];
+      var seen = {};
+
+      for (var i = 0; i < items.length; i++) {
+        var text = normalize_(items[i].text);
+        if (!text) continue;
+        if (seen[text]) continue;
+        seen[text] = true;
+
+        var en = '';
+        var cn = '';
+        try {
+          // use LanguageApp
+          en = LanguageApp.translate(text, 'zh-TW', 'en');
+          cn = LanguageApp.translate(text, 'zh-TW', 'zh-CN');
+        } catch (err) {
+          var errorId = Utilities.getUuid();
+          logWebhookError_(errorId, 'TRANSLATE_FAILED', text, err);
+          return json_({ ok: false, error: 'Translate failed', errorId: errorId });
+        }
+
+        var figmaUrl = (items[i].figmaUrl || '').toString();
+
+        rows.push([
+          '',       // property
+          '',       // character type
+          text,     // original text
+          en,       // en
+          cn,       // cn
+          '',       // Glossary
+          '',       // note
+          '',       // owner
+          '',       // Redmine
+          figmaUrl  // Figma link
+        ]);
+      }
+
+      if (rows.length > 0) {
+        var headerRow = 1;      // row 1-based
+        var startRow = 2;      
+        var numCols = 10;
+        var hadBodyRow = sheet.getLastRow() >= startRow;
+
+        // add new data below headrow
+        sheet.insertRowsAfter(headerRow, rows.length);
+
+        var writeRange = sheet.getRange(startRow, 1, rows.length, numCols);
+        writeRange.setValues(rows);
+
+        if (hadBodyRow) {
+          var templateRowIndexAfterInsert = startRow + rows.length; 
+          var templateRange = sheet.getRange(templateRowIndexAfterInsert, 1, 1, numCols);
+          templateRange.copyTo(writeRange, { formatOnly: true });
+        } else {
+          writeRange.clearFormat();
+        }
+      }
+
+      return json_({ ok: true, added: rows.length, received: items.length });
+    } catch (err) {
+      var errorId = Utilities.getUuid();
+      logWebhookError_(errorId, 'SERVER_ERROR', '', err);
+      return json_({ ok: false, error: 'Server error', errorId: errorId });
+    }
+  }
+
+  function normalize_(s) {
+    if (s === null || s === undefined) return '';
+    var t = s.toString();
+    t = t.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    t = t.replace(/\n/g, ' ');
+    t = t.replace(/\s+/g, ' ');
+    return t.trim();
+  }
+
+  function json_(obj) {
+    return ContentService
+      .createTextOutput(JSON.stringify(obj))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
+  function logWebhookError_(errorId, code, text, err) {
+    try {
+      var ss = SpreadsheetApp.getActiveSpreadsheet();
+      var sheetName = 'WebhookErrors';
+      var sheet = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+
+      if (sheet.getLastRow() === 0) {
+        sheet.appendRow(['time', 'errorId', 'code', 'text', 'error']);
+      }
+
+      sheet.appendRow([
+        new Date(),
+        errorId,
+        code,
+        (text || '').toString().slice(0, 500),
+        String(err).slice(0, 1000),
+      ]);
+    } catch (_) {
+      // avoid writing log fail and crash
+    }
